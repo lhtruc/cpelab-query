@@ -1,0 +1,206 @@
+WITH
+thresholds AS
+(
+    SELECT toDate('2026-09-24') AS local_date, 5.25 AS p30, 14.25 AS p40, 25.50 AS p50
+    UNION ALL
+    SELECT toDate('2026-09-25'), 5.25, 12.75, 23.25
+),
+
+client_daily AS
+(
+    SELECT
+        toDate(toTimeZone(created_at, 'Asia/Ho_Chi_Minh')) AS local_date,
+        model,
+        mac_address,
+        mac_client,
+
+        count() AS log_count,
+        avgIf(rssi, rssi >= -90 AND rssi <= -10) AS avg_rssi,
+        countIf(rssi >= -90 AND rssi <= -10) AS valid_rssi_logs
+
+    FROM cpe_log.client_logs_distributed
+
+    WHERE
+        date >= toDate('2026-09-24') - 1
+        AND date <= toDate('2026-09-25') + 1
+
+        AND toDate(toTimeZone(created_at, 'Asia/Ho_Chi_Minh'))
+            BETWEEN toDate('2026-09-24') AND toDate('2026-09-25')
+
+        AND toHour(toTimeZone(created_at, 'Asia/Ho_Chi_Minh')) >= 19
+        AND toHour(toTimeZone(created_at, 'Asia/Ho_Chi_Minh')) < 21
+
+        AND model IN ('AP-BE6500C', 'ONT-BE6500C')
+        AND interface_type = 'wireless'
+        AND mac_client != ''
+
+        AND interface NOT IN (
+            '2.4GHz',
+            'ath0',
+            'ath01',
+            'ath02',
+            'ath03',
+            'wlan5'
+        )
+
+    GROUP BY
+        local_date,
+        model,
+        mac_address,
+        mac_client
+),
+
+client_with_thresholds AS
+(
+    SELECT
+        c.local_date,
+        c.model,
+        c.mac_address,
+        c.mac_client,
+        c.log_count * 0.75 AS scaled_log_count,
+        c.avg_rssi,
+        c.valid_rssi_logs,
+        t.p30,
+        t.p40,
+        t.p50
+
+    FROM client_daily AS c
+    INNER JOIN thresholds AS t
+        ON c.local_date = t.local_date
+),
+
+eligible_clients AS
+(
+    SELECT
+        local_date,
+        model,
+        mac_address,
+        mac_client,
+        avg_rssi,
+        'P30' AS threshold
+    FROM client_with_thresholds
+    WHERE scaled_log_count >= p30
+        AND valid_rssi_logs > 0
+
+    UNION ALL
+
+    SELECT
+        local_date,
+        model,
+        mac_address,
+        mac_client,
+        avg_rssi,
+        'P40' AS threshold
+    FROM client_with_thresholds
+    WHERE scaled_log_count >= p40
+        AND valid_rssi_logs > 0
+
+    UNION ALL
+
+    SELECT
+        local_date,
+        model,
+        mac_address,
+        mac_client,
+        avg_rssi,
+        'P50' AS threshold
+    FROM client_with_thresholds
+    WHERE scaled_log_count >= p50
+        AND valid_rssi_logs > 0
+),
+
+cpe_coverage AS
+(
+    SELECT
+        local_date,
+        model,
+        threshold,
+        mac_address,
+
+        count() AS num_client,
+        countIf(avg_rssi >= -77) AS good_client,
+        100.0 * countIf(avg_rssi >= -77) / count() AS coverage_pct
+
+    FROM eligible_clients
+
+    GROUP BY
+        local_date,
+        model,
+        threshold,
+        mac_address
+),
+
+cpe_bucketed AS
+(
+    SELECT
+        local_date,
+        model,
+        threshold,
+        num_client,
+        coverage_pct,
+
+        multiIf(
+            num_client = 1, '1',
+            num_client = 2, '2',
+            num_client = 3, '3',
+            num_client = 4, '4',
+            num_client = 5, '5',
+            num_client = 6, '6',
+            num_client BETWEEN 7 AND 10, '7-10',
+            num_client BETWEEN 11 AND 20, '11-20',
+            num_client BETWEEN 21 AND 30, '21-30',
+            num_client BETWEEN 31 AND 50, '31-50',
+            '>50'
+        ) AS num_client_per_cpe,
+
+        multiIf(
+            num_client = 1, 1,
+            num_client = 2, 2,
+            num_client = 3, 3,
+            num_client = 4, 4,
+            num_client = 5, 5,
+            num_client = 6, 6,
+            num_client BETWEEN 7 AND 10, 7,
+            num_client BETWEEN 11 AND 20, 8,
+            num_client BETWEEN 21 AND 30, 9,
+            num_client BETWEEN 31 AND 50, 10,
+            11
+        ) AS bucket_order
+
+    FROM cpe_coverage
+)
+
+SELECT
+    local_date AS date,
+    model,
+    threshold,
+    num_client_per_cpe,
+    count() AS cpe_count,
+
+    round(quantile(0.10)(coverage_pct), 2) AS p10,
+    round(quantile(0.15)(coverage_pct), 2) AS p15,
+    round(quantile(0.20)(coverage_pct), 2) AS p20,
+    round(quantile(0.25)(coverage_pct), 2) AS p25,
+    round(quantile(0.30)(coverage_pct), 2) AS p30,
+    round(quantile(0.40)(coverage_pct), 2) AS p40,
+    round(quantile(0.50)(coverage_pct), 2) AS p50,
+    round(quantile(0.60)(coverage_pct), 2) AS p60,
+    round(quantile(0.70)(coverage_pct), 2) AS p70,
+    round(quantile(0.80)(coverage_pct), 2) AS p80,
+    round(quantile(0.90)(coverage_pct), 2) AS p90,
+    round(quantile(0.99)(coverage_pct), 2) AS p99
+
+FROM cpe_bucketed
+
+GROUP BY
+    local_date,
+    model,
+    threshold,
+    num_client_per_cpe,
+    bucket_order
+
+ORDER BY
+    threshold,
+    model,
+    local_date,
+    bucket_order;
