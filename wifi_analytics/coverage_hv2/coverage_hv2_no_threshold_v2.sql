@@ -1,6 +1,10 @@
 WITH
-    toDate('2026-09-21') AS start_date,
-    toDate('2026-09-27') AS end_date,
+    toDate(
+        toTimeZone(now(), 'Asia/Ho_Chi_Minh')
+    ) AS today_date,
+
+    today_date - 7 AS start_date,
+    today_date - 1 AS end_date,
 
 /* ============================================================
    1. Mean RSSI per client / CPE / day / band
@@ -66,6 +70,9 @@ client_daily AS
         AND model = 'AX3000HV2'
         AND interface_type = 'wireless'
         AND mac_client != ''
+        
+        /* Valid RSSI */ 
+        AND rssi BETWEEN -90 AND -10
 
     GROUP BY
         local_date,
